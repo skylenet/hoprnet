@@ -39,8 +39,49 @@ class PacketAcknowledgementInteraction<Chain extends HoprCoreConnector>
     this.node._libp2p.handle(this.protocols, this.handler.bind(this))
   }
 
-  handler(struct: Handler) {
-    pipe(struct.stream, this.handleHelper.bind(this))
+  async handler(struct: Handler) {
+    for await (const msg of struct.stream.source) {
+      const arr = msg.slice()
+      const acknowledgement = new Acknowledgement(this.node.paymentChannels, {
+        bytes: arr.buffer,
+        offset: arr.byteOffset
+      })
+
+      const unAcknowledgedDbKey = this.node._dbKeys.UnAcknowledgedTickets(await acknowledgement.hashedKey)
+
+      let tmp: Uint8Array
+      try {
+        tmp = await this.node.db.get(Buffer.from(unAcknowledgedDbKey))
+      } catch (err) {
+        if (err.notFound) {
+          error(
+            `received unknown acknowledgement from party ${blue(
+              (await pubKeyToPeerId(await acknowledgement.responseSigningParty)).toB58String()
+            )} for challenge ${yellow(u8aToHex(await acknowledgement.hashedKey))} - response was ${green(
+              u8aToHex(await acknowledgement.hashedKey)
+            )}. ${red('Dropping acknowledgement')}.`
+          )
+
+          continue
+        } else {
+          throw err
+        }
+      }
+
+      if (tmp.length == 0) {
+        // Deleting dummy DB entry
+        await this.node.db.del(Buffer.from(unAcknowledgedDbKey))
+      } else {
+        const unacknowledgedTicket = new UnacknowledgedTicket(this.node.paymentChannels, {
+          bytes: tmp.buffer,
+          offset: tmp.byteOffset
+        })
+
+        await this.handleAcknowledgement(unAcknowledgedDbKey, acknowledgement, unacknowledgedTicket)
+      }
+
+      this.emit(u8aToHex(unAcknowledgedDbKey))
+    }
   }
 
   async interact(counterparty: PeerId, acknowledgement: Acknowledgement<Chain>): Promise<void> {
@@ -77,94 +118,57 @@ class PacketAcknowledgementInteraction<Chain extends HoprCoreConnector>
     })
   }
 
-  async handleHelper(source: AsyncIterable<Uint8Array>): Promise<void> {
-    for await (const msg of source) {
-      const arr = msg.slice()
-      const acknowledgement = new Acknowledgement(this.node.paymentChannels, {
-        bytes: arr.buffer,
-        offset: arr.byteOffset
-      })
+  async handleAcknowledgement(
+    unAcknowledgedDbKey: Uint8Array,
+    acknowledgement: Acknowledgement<Chain>,
+    unacknowledgedTicket: UnacknowledgedTicket<Chain>
+  ): Promise<void> {
+    let ticketCounter: Uint8Array
+    try {
+      let tmpTicketCounter = await this.node.db.get(Buffer.from(this.node._dbKeys.AcknowledgedTicketCounter()))
 
-      const unAcknowledgedDbKey = this.node._dbKeys.UnAcknowledgedTickets(await acknowledgement.hashedKey)
+      ticketCounter = u8aAdd(true, tmpTicketCounter, ONE)
+    } catch (err) {
+      // Set ticketCounter to initial value
+      ticketCounter = toU8a(0, ACKNOWLEDGED_TICKET_INDEX_LENGTH)
+    }
 
-      let tmp: Uint8Array
-      try {
-        tmp = await this.node.db.get(Buffer.from(unAcknowledgedDbKey))
-      } catch (err) {
-        if (err.notFound) {
-          error(
-            `received unknown acknowledgement from party ${blue(
-              (await pubKeyToPeerId(await acknowledgement.responseSigningParty)).toB58String()
-            )} for challenge ${yellow(u8aToHex(await acknowledgement.hashedKey))} - response was ${green(
-              u8aToHex(await acknowledgement.hashedKey)
-            )}. ${red('Dropping acknowledgement')}.`
-          )
-
-          continue
-        } else {
-          throw err
-        }
+    let acknowledgedTicket = this.node.paymentChannels.types.AcknowledgedTicket.create(
+      this.node.paymentChannels,
+      undefined,
+      {
+        signedTicket: await unacknowledgedTicket.signedTicket,
+        response: await this.node.paymentChannels.utils.hash(
+          u8aConcat(unacknowledgedTicket.secretA, await acknowledgement.hashedKey)
+        ),
+        redeemed: false
       }
+    )
 
-      if (tmp.length > 0) {
-        const unacknowledgedTicket = new UnacknowledgedTicket(this.node.paymentChannels, {
-          bytes: tmp.buffer,
-          offset: tmp.byteOffset
-        })
+    const isWinningTicket = await this.node.paymentChannels.account.reservePreImageIfIsWinning(acknowledgedTicket)
 
-        let ticketCounter: Uint8Array
-        try {
-          let tmpTicketCounter = await this.node.db.get(Buffer.from(this.node._dbKeys.AcknowledgedTicketCounter()))
+    if (!isWinningTicket) {
+      log(`Got a ticket that is not a win. Dropping ticket.`)
+      await this.node.db.del(Buffer.from(unAcknowledgedDbKey))
+    }
 
-          ticketCounter = u8aAdd(true, tmpTicketCounter, ONE)
-        } catch (err) {
-          // Set ticketCounter to initial value
-          ticketCounter = toU8a(0, ACKNOWLEDGED_TICKET_INDEX_LENGTH)
-        }
+    const acknowledgedDbKey = this.node._dbKeys.AcknowledgedTickets(ticketCounter)
 
-        let acknowledgedTicket = this.node.paymentChannels.types.AcknowledgedTicket.create(
-          this.node.paymentChannels,
-          undefined,
-          {
-            signedTicket: await unacknowledgedTicket.signedTicket,
-            response: await this.node.paymentChannels.utils.hash(
-              u8aConcat(unacknowledgedTicket.secretA, await acknowledgement.hashedKey)
-            ),
-            redeemed: false
-          }
-        )
+    log(
+      `Storing ticket #${u8aToNumber(ticketCounter)} from ${blue(
+        (await pubKeyToPeerId(await acknowledgement.responseSigningParty)).toB58String()
+      )}. Ticket contains preImage for ${green(u8aToHex(await acknowledgement.hashedKey))}`
+    )
 
-        const isWinningTicket = await this.node.paymentChannels.account.reservePreImageIfIsWinning(acknowledgedTicket)
-
-        if (!isWinningTicket) {
-          log(`Got a ticket that is not a win. Dropping ticket.`)
-          await this.node.db.del(Buffer.from(unAcknowledgedDbKey))
-        }
-
-        const acknowledgedDbKey = this.node._dbKeys.AcknowledgedTickets(ticketCounter)
-
-        log(
-          `Storing ticket #${u8aToNumber(ticketCounter)} from ${blue(
-            (await pubKeyToPeerId(await acknowledgement.responseSigningParty)).toB58String()
-          )}. Ticket contains preImage for ${green(u8aToHex(await acknowledgement.hashedKey))}`
-        )
-
-        try {
-          await this.node.db
-            .batch()
-            .del(Buffer.from(unAcknowledgedDbKey))
-            .put(Buffer.from(acknowledgedDbKey), Buffer.from(acknowledgedTicket))
-            .put(Buffer.from(this.node._dbKeys.AcknowledgedTicketCounter()), Buffer.from(ticketCounter))
-            .write()
-        } catch (err) {
-          error(`Error while writing to database. Error was ${red(err.message)}.`)
-        }
-      } else {
-        // Deleting dummy DB entry
-        await this.node.db.del(Buffer.from(unAcknowledgedDbKey))
-      }
-
-      this.emit(u8aToHex(unAcknowledgedDbKey))
+    try {
+      await this.node.db
+        .batch()
+        .del(Buffer.from(unAcknowledgedDbKey))
+        .put(Buffer.from(acknowledgedDbKey), Buffer.from(acknowledgedTicket))
+        .put(Buffer.from(this.node._dbKeys.AcknowledgedTicketCounter()), Buffer.from(ticketCounter))
+        .write()
+    } catch (err) {
+      error(`Error while writing to database. Error was ${red(err.message)}.`)
     }
   }
 }
